@@ -73,4 +73,52 @@ def gdn_decode_fla(
     return o[0]
 
 
-__all__ = ["gdn_prefill_chunk_fla", "gdn_decode_fla"]
+def gdn_spec_verify_fla(
+    q: torch.Tensor,        # [1, total, num_k_heads, head_k_dim] bf16 (NOT GQA-expanded)
+    k: torch.Tensor,        # [1, total, num_k_heads, head_k_dim]
+    v: torch.Tensor,        # [1, total, num_v_heads, head_v_dim]
+    a: torch.Tensor,        # [total, num_v_heads] raw gate
+    b: torch.Tensor,        # [total, num_v_heads] raw beta
+    *,
+    A_log: torch.Tensor,        # [num_v_heads]
+    dt_bias: torch.Tensor,      # [num_v_heads]
+    state_source: torch.Tensor,  # [num_slots, num_v_heads, head_k_dim, head_v_dim] fp32
+    indices: torch.Tensor,       # [num_seqs] int32 slot id per request (the live GDN slot)
+    cu_seqlens: torch.Tensor,    # [num_seqs+1] varlen indptr (the W verify columns per request)
+    scale: float,
+    intermediate_states_buffer: torch.Tensor | None,  # [num_reqs, W, num_v_heads, head_k_dim, head_v_dim]
+    intermediate_state_indices: torch.Tensor | None,   # [num_reqs] int32 cache-entry id
+) -> torch.Tensor:
+    """DFlash2 spec-verify GDN recurrence (plan T9/T10, Agent 4b).
+
+    Runs the vendored ``fused_sigmoid_gating_delta_rule_update`` kernel in its ``target_verify``
+    mode over the W verify columns (varlen, one request per cu_seqlens segment): it caches the
+    per-column recurrent state ``b_h`` into ``intermediate_states_buffer`` after EVERY column and
+    SKIPS the live-slot write-back (``disable_state_update=True``). The round driver then folds
+    each GDN layer's state to the accepted column (N-1) by copying
+    ``intermediate_states_buffer[req, N-1]`` back to ``state_source[indices[req]]`` (the GDN
+    "num_accepted_tokens" / state-rewind seam, plan §4.4) -- because the committed prefix is a
+    PREFIX of the verify block, the state after the committed N columns is exactly the cached
+    column-(N-1) state.
+
+    Reuses the existing kernel (no new kernel; the target_verify params already exist). This is
+    the on-box validation point for the GDN state rewind.
+    """
+    from freetoken.kernel.fla import fused_sigmoid_gating_delta_rule_update
+
+    o = fused_sigmoid_gating_delta_rule_update(
+        A_log=A_log, a=a, dt_bias=dt_bias,  # stored fp32
+        softplus_beta=1.0, softplus_threshold=20.0,
+        q=q, k=k, v=v, b=b,
+        initial_state_source=state_source,
+        initial_state_indices=indices,  # int32 (the driver builds it int32)
+        scale=scale, use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens,
+        disable_state_update=True,  # the round driver owns the final-state write-back (rewind)
+        intermediate_states_buffer=intermediate_states_buffer,
+        intermediate_state_indices=intermediate_state_indices,
+    )
+    # kernel returns o = [NK, *v.shape] then squeeze(NK) -> [1, total, num_v, V]; o[0] -> [total, num_v, V]
+    return o[0]
+
+
+__all__ = ["gdn_prefill_chunk_fla", "gdn_decode_fla", "gdn_spec_verify_fla"]

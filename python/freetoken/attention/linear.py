@@ -43,6 +43,20 @@ class FLAMetadata:
     track_conv_src: torch.Tensor | None = None   # [nt, kernel-1] int64 conv-input token positions
     track_boundary_row: torch.Tensor | None = None  # [nt] int64 forward-local row of the track boundary; states with their own left context (qwen4_exp PLE) derive their windows from it
 
+    # --- DFlash2 spec-verify GDN rewind (plan T9/T10, Agent 4b); all None/False when the batch
+    # is not a DFlash2 verify, so the ordinary prefill/decode path is byte-for-byte unchanged. ---
+    # When ``spec_verify`` is set, the GDN layers run the fused sigmoid-gating recurrent kernel in
+    # target_verify mode over the W verify columns: they cache the per-column recurrent state into
+    # ``spec_intermediate_buffer[li]`` (one slice per GDN layer ``li``) and SKIP the live-slot
+    # write-back (``disable_state_update``). The round driver then folds each layer's state to the
+    # accepted column (N-1) by copying ``spec_intermediate_buffer[li, req, N-1]`` back to the live
+    # slot (the "num_accepted_tokens" / GDN-rewind seam, plan §4.4). This is the on-box validation
+    # point for the GDN state rewind.
+    spec_verify: bool = False
+    spec_intermediate_buffer: torch.Tensor | None = None  # [num_gdn_layers, num_reqs, W, HV, K, V]
+    spec_intermediate_indices: torch.Tensor | None = None  # [num_reqs] int32 cache-entry id (0..num_reqs-1)
+    spec_num_draft: int | None = None                    # W (the number of verify columns)
+
 
 def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     """Build the per-forward GDN metadata. Uses pinned host staging + non_blocking H2D

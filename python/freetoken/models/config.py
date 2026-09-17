@@ -246,6 +246,72 @@ class SlotStateSpec:
 
 
 @dataclass(frozen=True)
+class DFlash2DraftConfig:
+    """DFlash2 speculative-decoding drafter geometry (the optional masked-block draft
+    component of the Qwen3.5 target).
+
+    The drafter has **no hidden width of its own**: ``hidden_size`` is the *target's* hidden
+    width, because the draft conditions on target residual features (it reuses the target's
+    ``token_embedding`` / ``output_head``). All defaults below match the official 27B DFlash2
+    instance; ``parse_config`` normally fills them from the draft config block. The 35B-A3B row
+    in the reference geometry table is the (single) *DFlash*, not DFlash2 -- DFlash2 is the 27B
+    all-sliding instance only, so ``geometry`` reports ``"27b"`` for the canonical shape.
+    """
+
+    hidden_size: int  # H = target hidden width (5120 for 27B); the draft shares the target width
+    num_layers: int = 5  # draft layers (all sliding/local in 27B DFlash2)
+    intermediate_size: int = 17408  # draft FFN width
+    num_q_heads: int = 32
+    num_kv_heads: int = 8
+    head_dim: int = 128
+    # zero-based target block IDs whose residual outputs are concatenated for conditioning
+    target_layer_ids: tuple[int, ...] = (5, 19, 33, 47, 61)
+    sliding_window: int = 2048  # ring capacity S (local attention window)
+    mask_token_id: int = 0
+    # dynamic grouped convolution geometry (2 sides {input,output} x taps x group width)
+    conv_kernel_size: int = 2  # taps
+    conv_group_size: int = 16  # channels per conv group (G = H / group)
+    # candidate selector geometry (top-k shortlist, codebook rank)
+    selector_rank: int = 256
+    selector_top_k: int = 16
+    rms_norm_eps: float = 1e-6
+    rope_theta: float = 1e7  # 1-D split-half RoPE base (NOT the target's 3-axis MRoPE)
+
+    @property
+    def num_taps(self) -> int:
+        """Number of target residual taps concatenated into the conditioning vector."""
+        return len(self.target_layer_ids)
+
+    @property
+    def query_width(self) -> int:
+        return self.num_q_heads * self.head_dim
+
+    @property
+    def key_width(self) -> int:
+        return self.num_kv_heads * self.head_dim
+
+    @property
+    def feature_width(self) -> int:
+        """Input width of the (bias-free) feature projection: num_taps * H."""
+        return self.num_taps * self.hidden_size
+
+    @property
+    def conv_groups(self) -> int:
+        """Number of conv groups G = H / conv_group_size (320 for 27B)."""
+        return self.hidden_size // self.conv_group_size
+
+    @property
+    def conv_projection_rows(self) -> int:
+        """Rows of the dynamic ``kernel_projection``: 2*conv_kernel_size*G (1280 for 27B)."""
+        return 2 * self.conv_kernel_size * self.conv_groups
+
+    @property
+    def geometry(self) -> str:
+        # DFlash2 is the 27B all-sliding geometry; anything else is a custom (unvalidated) shape.
+        return "27b" if (self.num_layers == 5 and self.hidden_size == 5120) else "custom"
+
+
+@dataclass(frozen=True)
 class ModelConfig:
     num_layers: int
     num_qo_heads: int
@@ -337,6 +403,12 @@ class ModelConfig:
     # n-gram embedding geometry and the QSA indexer scoring geometry the model module
     # needs. Opaque to model-agnostic engine code; None for every other model.
     qwen4_args: Any | None = None
+    # Qwen3.5 (qwen3_5_moe) DFlash2 speculative-draft drafter payload (DFlash2DraftConfig):
+    # the masked-block drafter geometry attached to the target. The drafter is an OPTIONAL
+    # component and reuses the target's embedding/output head. Opaque to model-agnostic engine
+    # code; None when the checkpoint carries no DFlash2 drafter (the default, so every existing
+    # checkpoint loads unchanged).
+    dflash2_args: Any | None = None
     # Generic execution-path capability flags (set by a model's parse_config) so the engine and
     # factories stay model-agnostic instead of branching on dsv4_args:
     single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1

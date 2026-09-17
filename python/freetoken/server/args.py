@@ -159,6 +159,15 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
 
+    def _dflash2_draft_tokens(value: str) -> int:
+        try:
+            n = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be an integer in [1, 15]") from exc
+        if not 1 <= n <= 15:
+            raise argparse.ArgumentTypeError("must be in [1, 15]")
+        return n
+
     def _lazy_gpu_arg(value: str) -> tuple[str, ...]:
         from freetoken.gpu_select import gpu_arg
 
@@ -262,6 +271,41 @@ def parse_args(
         type=str,
         required=True,
         help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
+    )
+
+    parser.add_argument(
+        "--dflash2-path",
+        type=str,
+        default=ServerArgs.dflash2_path,
+        help=(
+            "DFlash2 drafter weights dir: a SEPARATE HF repo/dir (e.g. z-lab/Qwen3.6-27B-DFlash2). "
+            "Only used when the checkpoint config carries a DFlash2 drafter; the drafter reuses the "
+            "target's embedding/output head, so it is not in the target checkpoint. Default: none "
+            "(the drafter is not built and every existing checkpoint loads unchanged)."
+        ),
+    )
+
+    parser.add_argument(
+        "--spec",
+        type=str,
+        default=ServerArgs.spec,
+        choices=["none", "dflash2"],
+        help=(
+            "Speculative-decoding engine. 'none' (default) keeps the plain single-token decode path. "
+            "'dflash2' enables the DFlash2 masked-block drafter. A no-op unless the checkpoint config "
+            "carries a DFlash2 drafter (and --dflash2-path is given); the drafter remains the output "
+            "authority's speedup only -- the target stays the output authority."
+        ),
+    )
+
+    parser.add_argument(
+        "--dflash2-draft-tokens",
+        type=_dflash2_draft_tokens,
+        default=ServerArgs.dflash2_draft_tokens,
+        help=(
+            "Number of draft tokens K the DFlash2 drafter proposes per round (1..15, default 5). "
+            "Only used with --spec dflash2. The masked query block is W = K + 1 wide."
+        ),
     )
 
     parser.add_argument(

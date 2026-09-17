@@ -413,6 +413,46 @@ class Engine:
         else:
             self.linear_state_pool = None
 
+        # ======================= DFlash2 speculative-draft drafter context ring ========================
+        # Optional (plan T10, Agent 4b). Built ONLY when DFlash2 speculative decoding is enabled
+        # (--spec dflash2) AND the checkpoint actually carries a DFlash2 drafter (config.
+        # dflash2_args / self.model.dflash2). Every drafter-less or --spec none engine gets
+        # dflash2_ring_pool = None and the rest of the pipeline is byte-for-byte unchanged.
+        #
+        # The ring is per-request (one slot per running request); the slot id is the request's
+        # table_idx (Req.table_idx ranges 0..max_running_req, the last row being the dummy), so
+        # num_slots mirrors the page-table width and the scheduler's existing admit/free of
+        # table_idx covers the ring slot's lifetime (plan §4.6). The DFlash2 drafter is TP=1-only
+        # (replicated linears, per-rank ring; the draft/verify path never touches a TP
+        # communicator -- plan R3).
+        self.dflash2_ring_pool = None
+        self.dflash2_draft_count = int(config.dflash2_draft_tokens)
+        self.dflash2_mask_token_id = 0
+        self.dflash2_active = False
+        _dflash2_cfg = config.model_config.dflash2_args
+        _dflash2_drafter = getattr(self.model, "dflash2", None)
+        if config.spec == "dflash2" and _dflash2_cfg is not None and _dflash2_drafter is not None:
+            from freetoken.kvcache.dflash2_ring_pool import DFlash2RingPool
+
+            # One slot per table_idx (0..max_running_req inclusive); the engine's dummy row uses
+            # table_idx = max_running_req, so the pool needs max_running_req + 1 slots.
+            self.dflash2_ring_pool = DFlash2RingPool(
+                _dflash2_cfg, config.max_running_req + 1, device=self.device
+            )
+            self.dflash2_mask_token_id = int(getattr(_dflash2_cfg, "mask_token_id", 0))
+            self.dflash2_active = True
+            logger.info_rank0(
+                f"DFlash2 drafter enabled: K={self.dflash2_draft_tokens} draft tokens, "
+                f"ring {self.dflash2_ring_pool.num_slots - 1} slots x "
+                f"{self.dflash2_ring_pool.bytes_per_slot / (1 << 20):.1f} MiB/slot "
+                f"(sliding_window={_dflash2_cfg.sliding_window})"
+            )
+        elif config.spec == "dflash2":
+            logger.warning_rank0(
+                "--spec dflash2 requested but this checkpoint carries no DFlash2 drafter "
+                "(no dflash2_args); falling back to the plain decode path"
+            )
+
         # ======================= Page table initialization ========================
         # NOTE: 1. aligned to 128 bytes; 2. store raw locations instead of pages
         self.max_seq_len = min(config.max_seq_len, num_tokens)
@@ -507,6 +547,17 @@ class Engine:
                 "family served images. Reconvert it with `ft checkpoint`, add the encoder in place with "
                 "scripts/ftw_hotfix.py (docs/ftw-hotfix.md), or start with --text-model-only"
             )
+        # DFlash2 drafter (optional, qwen3_5_moe): request the external drafter checkpoint ONLY when
+        # the model actually carries a drafter (config.dflash2_args, set by the checkpoint's parse_config).
+        # The drafter reuses the target's embedding/output head, so its weights live in a SEPARATE repo
+        # (config.dflash2_path); with no drafter this stays False and the default load path is unchanged.
+        # Fail loudly if the drafter is present but no path was given (it cannot build without it).
+        include_draft = config.model_config.dflash2_args is not None
+        if include_draft and config.dflash2_path is None:
+            raise ValueError(
+                f"{config.model_path} carries a DFlash2 drafter (dflash2_args) but no drafter weights "
+                "path was given; pass --dflash2-path <z-lab/...-DFlash2> (the separate drafter repo)"
+            )
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # offload models exclude experts (served from the offload cache, not dense weights).
@@ -517,6 +568,8 @@ class Engine:
                 self.device,
                 include_moe_experts=not is_offload_moe_strategy(config.moe_strategy),
                 include_vision=bool(config.active_encoders),
+                include_draft=include_draft,
+                draft_path=config.dflash2_path if include_draft else None,
             ),
             device=self.device,
         )
@@ -1005,6 +1058,59 @@ class Engine:
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    # ------------------------------------------------------------------ DFlash2 (plan T10)
+
+    def dflash2_output_head_weight(self) -> torch.Tensor:
+        """The target's output-head weight ``[vocab, H]`` as a plain (dequantized, TP=1) tensor.
+
+        The DFlash2 proposal head and the verify's per-column target distributions are both
+        ``F.linear(hidden, output_head_weight)`` (NO softmax/penalty), matching the target's own
+        ``ParallelLMHead.forward`` (which, for tied embeddings, is ``F.linear(x,
+        tied_embedding.weight)``). TP=1 only (the drafter never shards -- plan R3), so this is a
+        single full-vocab tensor.
+
+        TODO(ON-BOX, greedy parity): confirm this weight (and its dtype) reproduces the target's
+        per-position argmax EXACTLY for a temperature-0 prompt -- the DFlash2 temp-0 output must
+        equal FreeToken's own non-speculative greedy decode (plan §6.3 gate). For tied embeddings
+        (the 27B case) this is the input-embedding weight; for a quantized non-tied lm_head the
+        reference path expects a bf16 dequant (raise here until that is validated on the box).
+        """
+        lm_head = self.model.lm_head
+        if getattr(lm_head, "tied_embedding", None) is not None:
+            return lm_head.tied_embedding.weight
+        w = getattr(lm_head, "weight", None)
+        if w is not None:
+            return w
+        qm = getattr(lm_head, "quant_method", None)
+        if qm is not None and getattr(qm, "weight", None) is not None:
+            w = qm.weight
+            if w.dtype in (torch.float32, torch.bfloat16, torch.float16):
+                return w
+        raise RuntimeError(
+            "DFlash2 output-head weight is not a plain bf16/fp16 tensor (quantized non-tied "
+            "lm_head); dequant to bf16 for the reference path (plan O2) before enabling --spec dflash2"
+        )
+
+    def dflash2_proposal_head(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Raw public-vocab logits ``F.linear(hidden, output_head_weight)`` (NO softmax/penalty).
+
+        ``hidden`` ``[K, H]`` (or ``[n, H]``) -> ``[K, vocab]``. Used by the round driver for BOTH
+        the candidate selector's top-16 (over raw logits) and the verify's per-column target
+        distributions (softmax of this), so the two share one exact head -- matching the target's
+        own output authority (plan §0.2 "Proposal-head top-16 is over RAW logits", R1).
+        """
+        import torch.nn.functional as F
+
+        return F.linear(hidden, self.dflash2_output_head_weight())
+
+    def dflash2_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """The target's ``embed_tokens`` for a batch of text token ids (the DFlash2 query block).
+
+        ``token_ids`` ``[W,]`` int32 -> ``[W, H]`` bf16. The DFlash2 query block ``[a, MASK, ...]``
+        is pure text, so the plain embedding op (no multimodal merge) is correct here.
+        """
+        return self.model.model.embed_tokens.forward(token_ids)
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:

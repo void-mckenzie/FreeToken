@@ -64,6 +64,12 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    # DFlash2 speculative-decoding per-request round state (plan T9/T10, Agent 4b). Set by the
+    # scheduler's DFlash2 round driver once DFlash2 is enabled for this model; None for every
+    # non-DFlash2 model / request (the default path is untouched). Carries the ring slot, the
+    # committed frontier F, the anchor a, and the pending target features for the next round's
+    # context materialization (see freetoken.models.qwen3_5_moe.dflash2_loop.DFlash2ReqState).
+    dflash2_state: "object | None" = None
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -154,10 +160,20 @@ class Batch:
     # _prepare_batch succeeds. Continuation chunks leave this empty, so accounting is
     # exactly-once.
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
+    # DFlash2 speculative-decoding round results (plan T10, Agent 4b). Set by the scheduler's
+    # DFlash2 round driver on a decode batch: a per-req list aligned to ``reqs`` of
+    # ``dflash2_loop.DFlash2StepResult`` (the N published tokens + accepted count). None for every
+    # non-DFlash2 batch, so ``_process_last_data`` takes its original single-token path.
+    dflash2_results: "list | None" = field(default=None, init=False)
 
     @property
     def is_prefill(self) -> bool:
         return self.phase == "prefill"
+
+    @property
+    def is_dflash2(self) -> bool:
+        """True for a decode batch driven by the DFlash2 round driver (publishes N tokens/req)."""
+        return self.dflash2_results is not None
 
     @property
     def is_decode(self) -> bool:

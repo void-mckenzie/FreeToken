@@ -89,6 +89,30 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
+    # DFlash2 speculative-draft drafter weights dir (optional, a SEPARATE HF repo/dir, e.g.
+    # z-lab/Qwen3.6-27B-DFlash2). Read only when the checkpoint's config carries a DFlash2 drafter
+    # (dflash2_args); the drafter reuses the target's embedding/output head so it is not in the
+    # target checkpoint. None (default) keeps every existing checkpoint loading unchanged.
+    dflash2_path: str | None = None
+    # --- DFlash2 speculative-decoding runtime knobs (Agent 4b / plan T10) ---
+    # The speculative-decoding engine to enable. "none" (default) keeps the plain single-token
+    # decode path byte-for-byte unchanged; "dflash2" enables the DFlash2 drafter. The flag is a
+    # NO-OP unless the checkpoint's config actually carries a DFlash2 drafter (model_config.
+    # dflash2_args is not None) -- so passing --spec dflash2 to a drafter-less checkpoint does
+    # nothing (the drafter cannot build). See Engine.dflash2_active.
+    spec: str = "none"
+    # Number of draft tokens K the DFlash2 drafter proposes per round (1..15, default 5). The
+    # masked query block is W = K + 1 wide and the target verifies P = K live columns.
+    dflash2_draft_tokens: int = 5
+
+    @property
+    def dflash2_active(self) -> bool:
+        """DFlash2 speculative decoding is requested AND the checkpoint carries a drafter."""
+        return (
+            self.spec == "dflash2"
+            and getattr(self, "model_config", None) is not None
+            and self.model_config.dflash2_args is not None
+        )
     # Runtime knobs of the multimodal path; the architecture side (vision_config, mrope) lives in ModelConfig.
     mm: MultimodalConfig = field(default_factory=MultimodalConfig)
 

@@ -148,6 +148,26 @@ class Scheduler(SchedulerIOMixin):
             decode_log_interval=config.decode_log_interval,
         )
 
+        # DFlash2 speculative-decoding round driver (plan T10). None for every no-drafter /
+        # --spec none engine, so the default decode path is byte-for-byte unchanged. The ring
+        # slot mirrors table_idx, so the existing table_idx admit/free (and the cache-manager tail
+        # free on finish) covers its lifetime -- no new global machinery.
+        self.dflash2_driver = None
+        if self.engine.dflash2_active:
+            from freetoken.models.qwen3_5_moe.dflash2_loop import DFlash2RoundDriver
+
+            self.dflash2_driver = DFlash2RoundDriver(
+                engine=self.engine,
+                model=self.engine.model,
+                drafter=self.engine.model.dflash2,
+                ring=self.engine.dflash2_ring_pool,
+                cache_manager=self.cache_manager,
+                token_pool=self.token_pool,
+                draft_count=self.engine.dflash2_draft_count,
+                mask_token_id=self.engine.dflash2_mask_token_id,
+                eos_token_ids=self.eos_token_ids,
+            )
+
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
 
@@ -343,6 +363,59 @@ class Scheduler(SchedulerIOMixin):
                     # and the next batch is scheduled before this drain runs). Its resources
                     # are freed below/already; shipping this token would append past the
                     # client's terminal reply.
+                    continue
+                if batch.is_dflash2:
+                    # DFlash2 decode: the round driver already COMMITTED the N licensed tokens to
+                    # the req (append_host + device_len + cached_len) in _forward, so there is NO
+                    # append_host here. Publish one DetokenizeMsg per published token (reusing the
+                    # per-token frontend message) and detect finish from the post-commit req state.
+                    res = batch.dflash2_results[i]
+                    published = res.published  # CPU int32 [N]
+                    n_pub = int(published.numel())
+                    if n_pub > 0:
+                        hit_length = not req.can_decode
+                        hit_eos = (
+                            not req.sampling_params.ignore_eos
+                            and int(published[-1].item()) in self.eos_token_ids
+                        )
+                        matched_stop = (
+                            self._match_stop_str(req)
+                            if not hit_eos and req.sampling_params.stop_strs
+                            else None
+                        )
+                    else:
+                        # N == 0 (budget exhausted / nothing licensed): ends by length.
+                        hit_length = not req.can_decode
+                        hit_eos = False
+                        matched_stop = None
+                    finished = hit_length or hit_eos or matched_stop is not None
+                    finish_reason = (
+                        ("stop" if (hit_eos or matched_stop is not None) else "length")
+                        if finished
+                        else None
+                    )
+                    for j in range(n_pub):
+                        is_last = j == n_pub - 1
+                        reply.append(
+                            DetokenizeMsg(
+                                uid=req.uid,
+                                next_token=int(published[j].item()),
+                                finished=finished and is_last,
+                                finish_reason=(
+                                    finish_reason if (finished and is_last) else None
+                                ),
+                                matched_stop=(
+                                    matched_stop if (finished and is_last) else None
+                                ),
+                                stop_strs=req.sampling_params.stop_strs or None,
+                            )
+                        )
+                    # No per-step cache_req (mirrors the normal decode path); the KV scratch is kept
+                    # by the page table and freed by _free_req_resources -> cache_req on finish.
+                    if finished and req not in self.finished_reqs:
+                        self.decode_manager.remove_req(req)
+                        self._free_req_resources(req)
+                        new_finished_reqs.add(req)
                     continue
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
@@ -631,6 +704,10 @@ class Scheduler(SchedulerIOMixin):
         # slots to two later requests. table_idx == -1 marks an already-freed request.
         if req.table_idx == -1:
             return
+        # DFlash2: free the request's context-ring slot (mirrors table_idx; idempotent). cache_req
+        # below also frees the KV-scratch tail past req.cached_len (the unused verify columns).
+        if self.dflash2_driver is not None and req.dflash2_state is not None:
+            self.dflash2_driver.release(req)
         # Polymorphic free: the DSV4 manager returns the request's window pages + cmp/idx blocks
         # to their tier free-lists; the generic manager frees its KV pages (it reads
         # page_table[req.table_idx], so free the table entry after).
@@ -874,6 +951,13 @@ class Scheduler(SchedulerIOMixin):
         )
         if batch is None:
             return None
+        if batch.is_decode and self.dflash2_driver is not None:
+            # DFlash2 speculative decode: the round driver does its OWN varlen-verify prepare +
+            # forward + accept + commit inside _forward (on the engine stream), so it bypasses the
+            # normal _prepare_batch / engine.forward_batch path. A null input_tuple marks the
+            # DFlash2 ForwardInput for _forward. TODO(ON-BOX): scheduler state-machine change --
+            # decode batches no longer go through the graph-captured decode path.
+            return ForwardInput(batch=batch, sample_args=None, input_tuple=None, write_tuple=None)
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
         return forward_input
@@ -903,6 +987,23 @@ class Scheduler(SchedulerIOMixin):
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
+        if self.dflash2_driver is not None and input_mapping is None:
+            # DFlash2 speculative round (input_mapping is None => the DFlash2 ForwardInput from
+            # _schedule_next_batch). This runs on the engine stream (inside engine_stream_ctx), so
+            # the driver's varlen verify forward + KV/page-table/GDN writes are program-ordered like
+            # engine.forward_batch. The driver commits the N licensed tokens to each req (advance +
+            # GDN rewind + ring pending); _process_last_data publishes them from batch.dflash2_results.
+            for req in batch.reqs:
+                if req.dflash2_state is None:
+                    self.dflash2_driver.admit(req)
+            results, copy_done = self.dflash2_driver.step(batch.reqs)
+            batch.dflash2_results = results
+            # Drop budget-exhausted reqs (mirrors the normal path's filter_reqs); EOS-finished reqs
+            # stay until _process_last_data frees them (the same overlap race the normal path has).
+            self.decode_manager.filter_reqs(batch.reqs)
+            from freetoken.engine import ForwardOutput as _ForwardOutput
+
+            return _ForwardOutput(None, None, copy_done)
         batch.input_ids = self.token_pool[input_mapping]
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)

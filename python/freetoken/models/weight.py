@@ -212,6 +212,8 @@ def load_weight(
     *,
     include_moe_experts: bool = True,
     include_vision: bool = True,
+    include_draft: bool = False,
+    draft_path: str | None = None,
 ) -> Iterator[Tuple[str, torch.Tensor]]:
     # FTW checkpoint: dense weights are stored post-iter_weights, so we replay them
     # model-agnostically instead of re-running the per-model reader. Which tensors exist is
@@ -220,6 +222,15 @@ def load_weight(
     # just yields the stored weight tensors regardless of the include_moe_experts flag.
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, iter_ftw_weights
     from freetoken.models.config import VISION_KEY_PREFIXES
+
+    # The DFlash2 drafter is an external, SEPARATE checkpoint (never inside an FTW target); asking
+    # for it against an FTW path can only silently drop the drafter keys, so refuse loudly.
+    if include_draft and is_ftw_checkpoint(model_path):
+        raise ValueError(
+            "DFlash2 drafter weights are not stored in an FTW checkpoint; the drafter is a separate "
+            "HF repo (--dflash2-path). Serve the drafter from a non-FTW target, or fold the drafter "
+            "tensors into the FTW at conversion."
+        )
 
     # a text-only engine never built the tower, so its tensors are not even read
     keep = None if include_vision else (lambda name: not name.startswith(VISION_KEY_PREFIXES))
@@ -230,6 +241,12 @@ def load_weight(
         iter_weights = _load_attr(spec.module, spec.iter_weights)
         # only a family that registers an encoder is asked about the tower; the others never load one
         kwargs = {"include_vision": include_vision} if spec.encoders else {}
+        # only a family whose iter_weights takes the drafter args (qwen3_5_moe) is asked for it; the
+        # engine only sets include_draft when the checkpoint actually carries a drafter (dflash2_args),
+        # which no other family sets.
+        if include_draft:
+            kwargs["include_draft"] = True
+            kwargs["draft_path"] = draft_path
         weights = iter_weights(
             model_path,
             device,

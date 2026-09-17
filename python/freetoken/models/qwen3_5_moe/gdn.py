@@ -149,7 +149,36 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
-        if batch.is_decode:
+        if fla.spec_verify:
+            # DFlash2 spec-verify (plan T9/T10, Agent 4b): a varlen forward over the W verify
+            # columns. The varlen causal conv runs over all W tokens, then the fused recurrent
+            # kernel caches the per-column recurrent state and SKIPS the live-slot write-back so
+            # the round driver can fold the state to the accepted column (N-1). ON-BOX VALIDATION:
+            # (a) the varlen verify metadata (cu_seqlens / cache_indices / has_initial_state), and
+            # (b) the GDN state rewind (the round driver copies column (N-1) back to the live slot).
+            from .gdn_kernels import gdn_spec_verify_fla
+
+            mixed = self._conv_prefill(
+                conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
+            # fresh-state zeroing is a no-op here (every verify request continues a committed
+            # prefix); guard anyway so a fresh-sequence verify never reads a stale slot.
+            if fla.fresh_state_indices is not None:
+                pool.recurrent_states[li].index_fill_(0, fla.fresh_state_indices, 0.0)
+            qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+            q = qf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
+            k = kf.reshape(1, total, self.num_k_heads, self.head_k_dim).to(dtype)
+            v = vf.reshape(1, total, self.num_v_heads, self.head_v_dim).to(dtype)
+            spec_buf = (
+                fla.spec_intermediate_buffer[li] if fla.spec_intermediate_buffer is not None else None
+            )
+            core_out = gdn_spec_verify_fla(
+                q, k, v, a, b, A_log=self.A_log, dt_bias=self.dt_bias,
+                state_source=pool.recurrent_states[li], indices=fla.cache_indices,
+                cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
+                intermediate_states_buffer=spec_buf,
+                intermediate_state_indices=fla.spec_intermediate_indices,
+            )
+        elif batch.is_decode:
             # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
             # per-request state read/write-by-index, all in one kernel (no gather/scatter,
             # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).

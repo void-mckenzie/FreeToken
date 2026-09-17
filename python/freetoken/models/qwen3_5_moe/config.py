@@ -4,6 +4,7 @@ from typing import Any
 
 from freetoken.layers.quantization import QuantConfig, QuantKind
 from freetoken.models.config import (
+    DFlash2DraftConfig,
     FullAttentionGroupConfig,
     LinearGatedDeltaGroupConfig,
     ModelConfig,
@@ -35,6 +36,102 @@ def _layer_types(text: Any) -> list[str]:
         "full_attention" if (i + 1) % interval == 0 else "linear_attention"
         for i in range(n)
     ]
+
+
+# ------------------------------------------------------------------ DFlash2 drafter config
+#
+# The DFlash2 drafter is an OPTIONAL component of the target. Its geometry (attention dims,
+# draft-layer count, FFN width, norm eps, 1-D RoPE theta, the residual taps, the sliding-window
+# scalar S, the conv tap/group dims, the selector rank/top-k and the mask token id) is read from
+# a drafter config block. ninfer reads it from a separate component whose inner ``dflash_config``
+# carries the DFlash2-specific fields (see ninfer src/models/qwen3_5/config.cpp::draft); the exact
+# on-box field names of the FreeToken target config.json are open item O4, so the lookup below is
+# tolerant of a few plausible embeddings and defaults to None when absent (every existing
+# checkpoint then loads unchanged).
+
+# candidate top-level keys that, when present, hold the drafter config block
+_DFLASH2_BLOCK_KEYS = ("dflash_config", "dflash2_config", "dflash2", "draft_config")
+
+
+def _field(obj: Any, name: str, default: Any = None) -> Any:
+    """Read ``name`` from a dict OR an attribute-style config object."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _find_dflash2_block(hf_config: Any, text: Any) -> Any:
+    """Locate the DFlash2 drafter config block, or None when the checkpoint carries no drafter.
+
+    Accepts the block on the top-level config or on ``text_config``; the block is recognised when
+    it carries the DFlash2 inner config (``dflash_config`` / ``target_layer_ids``) or the draft
+    geometry (``num_hidden_layers``).
+    """
+    for root in (hf_config, text):
+        for key in _DFLASH2_BLOCK_KEYS:
+            block = _field(root, key)
+            if block is None or isinstance(block, (str, int, float, bool)):
+                continue
+            if (
+                _field(block, "dflash_config") is not None
+                or _field(block, "target_layer_ids") is not None
+                or _field(block, "num_hidden_layers") is not None
+            ):
+                return block
+    return None
+
+
+def parse_dflash2_args(hf_config: Any, text: Any, hidden_size: int) -> DFlash2DraftConfig | None:
+    """Build a ``DFlash2DraftConfig`` from the checkpoint's drafter block, or ``None`` when absent.
+
+    The hidden width H and the embedding/output head come from the target (the drafter stores
+    neither). Attention/FFN/norm/RoPE geometry and the ``dflash_config`` DFlash2 fields are read
+    from the block with the official 27B geometry as the default for any field left unspecified.
+    """
+    block = _find_dflash2_block(hf_config, text)
+    if block is None:
+        return None
+    # the DFlash2-specific fields live in the inner ``dflash_config``; a flat block keeps them
+    # alongside the geometry.
+    inner = _field(block, "dflash_config")
+    if inner is None:
+        inner = block
+
+    target_layer_ids = _field(inner, "target_layer_ids")
+    if target_layer_ids is None:
+        return None  # a block without the DFlash2 taps is not a drafter
+    target_layer_ids = tuple(int(t) for t in target_layer_ids)
+    if not target_layer_ids:
+        return None
+
+    rope_params = _field(block, "rope_parameters")
+    rope_theta = _field(rope_params, "rope_theta", _field(block, "rope_theta", 1e7))
+
+    cfg = DFlash2DraftConfig(
+        hidden_size=int(hidden_size),
+        num_layers=int(_field(block, "num_hidden_layers", 5)),
+        intermediate_size=int(_field(block, "intermediate_size", 17408)),
+        num_q_heads=int(_field(block, "num_attention_heads", 32)),
+        num_kv_heads=int(_field(block, "num_key_value_heads", 8)),
+        head_dim=int(_field(block, "head_dim", 128)),
+        target_layer_ids=target_layer_ids,
+        sliding_window=int(_field(block, "sliding_window", 2048)),
+        mask_token_id=int(_field(inner, "mask_token_id", 0)),
+        conv_kernel_size=int(_field(inner, "conv_kernel_size", 2)),
+        conv_group_size=int(_field(inner, "conv_group_size", 16)),
+        selector_rank=int(_field(inner, "selector_rank", 256)),
+        selector_top_k=int(_field(inner, "selector_top_k", 16)),
+        rms_norm_eps=float(_field(block, "rms_norm_eps", 1e-6)),
+        rope_theta=float(rope_theta),
+    )
+    # mirror ninfer config.cpp::draft sanity checks (loud failure on an inconsistent block)
+    if cfg.hidden_size % cfg.conv_group_size:
+        raise ValueError(f"DFlash2 conv group size {cfg.conv_group_size} does not divide hidden width {cfg.hidden_size}")
+    if cfg.num_q_heads % cfg.num_kv_heads:
+        raise ValueError(f"DFlash2 query heads {cfg.num_q_heads} not divisible by KV heads {cfg.num_kv_heads}")
+    return cfg
 
 
 def parse_config(hf_config: Any) -> ModelConfig:
@@ -142,7 +239,8 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attention_groups=groups,
         expert_quant=expert_quant,
         weight_block_size=weight_block_size,
+        dflash2_args=parse_dflash2_args(hf_config, text, text.hidden_size),
     )
 
 
-__all__ = ["parse_config"]
+__all__ = ["parse_config", "parse_dflash2_args"]
