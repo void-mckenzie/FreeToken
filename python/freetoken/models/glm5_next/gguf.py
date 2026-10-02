@@ -222,7 +222,9 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         indexer_rope_interleave=False,
         index_kpool=int(g("attention.indexer.kpool")),
         index_kpool_compress=bool(kcompress),
-        index_kpool_always_select_tail=False,
+        # Not in the GGUF metadata (predates the llama.cpp key); the served
+        # zai-org/GLM-5.3-Flash config sets it true, and so does llama.cpp's default.
+        index_kpool_always_select_tail=True,
         linear_attn_config={
             "num_heads": kda_heads,
             "head_dim": int(g("kda.head_dim")),
@@ -383,7 +385,13 @@ def iter_gguf_weights(
                 continue
             if suffix in _KDA_DENSE_MAP:
                 rel, dtype = _KDA_DENSE_MAP[suffix]
-                yield f"{base}.{rel}", _to_dtype(t, dtype)
+                val = _to_dtype(t, dtype)
+                if suffix == "ssm_a":
+                    # llama.cpp's glm5next converter stores this pre-transformed as
+                    # -exp(A_log) (conversion/glm.py); FreeToken's KDA kernels expect
+                    # the raw A_log and apply the exp inside. Invert at load.
+                    val = torch.log(-val)
+                yield f"{base}.{rel}", val
                 continue
             if suffix in _KDA_PACKED_MAP:
                 yield f"{base}.{_KDA_PACKED_MAP[suffix]}.qweight", t.packed()
