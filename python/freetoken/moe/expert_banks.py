@@ -172,9 +172,28 @@ def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     )
 
 
+def _gguf_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    if parallel:
+        raise NotImplementedError(
+            "parallel reader not implemented for gguf_glm5: see _q4_0_banks"
+        )
+    from freetoken.models.weight import load_gguf_moe_expert_sources
+
+    # Native GGUF experts (GLM-5.3-Flash UD-IQ4_XS tier): packed IQ3_S/IQ4_XS block
+    # bytes streamed to the GPU and dequantized inside the borrowed ggml MoE kernels
+    # (no bf16 expert copy). Same pin-after-fill HostBank lifecycle as q4_0.
+    sink = None if dummy else layer_sink
+    sources = load_gguf_moe_expert_sources(model_path, model_config, dummy=dummy, layer_sink=sink)
+    return ExpertBanks(
+        "gguf_glm5", {name: sources[name] for name in _BANK_SCHEMAS["gguf_glm5"]},
+        streamed=sink is not None,
+    )
+
+
 # expert formats that still load through their own provider (GGUF)
 _PROVIDERS = {
     "q4_0": _q4_0_banks,
+    "gguf_glm5": _gguf_banks,
 }
 
 

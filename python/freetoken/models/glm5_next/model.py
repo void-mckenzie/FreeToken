@@ -168,6 +168,13 @@ class Glm5NextForCausalLM(BaseLLMModel):
             quant_config=config.quant,
             prefix="lm_head",
         )
+        # Native-GGUF checkpoints (unsloth glm5next tier): swap the dense projections,
+        # embedding and (untied) head to packed native-quant ops -- gemma4 GGUF
+        # precedent; the GGUF parse marks itself via moe_weight_format.
+        from .gguf import convert_glm5_next_to_gguf, is_gguf_model
+
+        if is_gguf_model(config):
+            convert_glm5_next_to_gguf(self, config)
 
     def prepare_for_runtime(self) -> None:
         """Post-load, pre-KV-sizing hook: materialize the DSA layers' bmm-ready

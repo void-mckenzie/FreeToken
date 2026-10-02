@@ -18,6 +18,7 @@ from .reader import gguf_architecture, load_gguf_metadata, gguf_tensor_names
 # reuses the model classes but a GGUF parse_config / iter_weights).
 GGUF_ARCH_TO_REGISTRY: dict[str, str] = {
     "gemma4": "Gemma4GGUFForCausalLM",
+    "glm5next": "Glm5NextGGUFForConditionalGeneration",
 }
 
 
@@ -44,14 +45,15 @@ class GgufConfigShim:
 
 
 def _vocab_size(model_path: str) -> int:
-    from .reader import _reader
+    from .reader import iter_gguf_tensors
 
-    for t in _reader(model_path).tensors:
+    for t in iter_gguf_tensors(model_path):
         if t.name == "token_embd.weight":
-            return int(t.shape[-1])  # ggml [hidden, vocab] -> vocab is last
-    # A metadata-only GGUF (an FTW dir's source_metadata.gguf) strips the tensor table, so
-    # fall back to the tokenizer vocab. llama.cpp sizes token_embd's rows to n_vocab =
-    # len(tokenizer.ggml.tokens), so this equals the tensor-derived value exactly.
+            return int(t.shape[0])  # GgufTensor torch order: [vocab, hidden]
+    # A metadata-only GGUF (an FTW dir's source_metadata.gguf, or a split set's shard
+    # 1) has no token_embd in the shard we opened; fall back to the tokenizer vocab.
+    # llama.cpp sizes token_embd's rows to n_vocab = len(tokenizer.ggml.tokens), so
+    # this equals the tensor-derived value exactly.
     toks = load_gguf_metadata(model_path).get("tokenizer.ggml.tokens")
     if toks is not None:
         return len(toks)

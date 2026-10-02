@@ -432,7 +432,23 @@ class OffloadMoELayer(MoELayer):
             return fused_experts_gguf_q4_0(
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
             )
-        raise AssertionError(f"offload experts without a quant method only serve q4_0 banks, got {fmt!r}")
+        if fmt == "gguf_glm5":
+            # Native GGUF experts for GLM-5.3-Flash: gate/up banks are IQ3_S, down banks
+            # IQ4_XS; both dequantize inside the ggml MoE vec kernels. GLM experts run
+            # clamped SwiGLU, so the activation limit rides along (self.limit).
+            from freetoken.moe.fused_q4_0 import fused_experts_gguf
+            from freetoken.moe.offload_cache import GGUF_EXPERT_QTYPES
+
+            qt_gate_up, qt_down = GGUF_EXPERT_QTYPES[fmt]
+            gate_up, down = views
+            return fused_experts_gguf(
+                hidden_states, gate_up, down, topk_weights, topk_ids,
+                self.activation, qt_gate_up, qt_down, limit=self.limit,
+            )
+        raise AssertionError(
+            f"offload experts without a quant method only serve gguf banks "
+            f"(q4_0 / gguf_glm5), got {fmt!r}"
+        )
 
 
 def make_moe_layer(

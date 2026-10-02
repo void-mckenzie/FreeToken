@@ -303,6 +303,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         "Glm5NextForCausalLM",
         packed_modules_mapping=_GLM5_NEXT_PACKED,
     ),
+    # GGUF (native IQ3_S/IQ4_XS experts, Q8_0 dense) glm5next: same model classes,
+    # GGUF config + weight loaders. No vision: the GGUF ships no vision tower.
+    "Glm5NextGGUFForConditionalGeneration": ModelSpec(
+        "freetoken.models.glm5_next",
+        "Glm5NextForConditionalGeneration",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
 }
 
 

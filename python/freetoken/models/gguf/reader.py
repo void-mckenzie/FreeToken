@@ -20,11 +20,33 @@ import numpy as np
 import torch
 
 
+import re as _re
+
+# llama.cpp split GGUF naming: "<name>-00001-of-00005.gguf". In a split set every
+# shard carries the FULL KV section (metadata) plus only its own tensor table; the
+# tensors themselves live in exactly one shard, so config reads shard 1 and the
+# tensor iteration concatenates all of them.
+_SPLIT_GGUF = _re.compile(r"-\d{5}-of-\d{5}\.gguf$")
+
+
+def _split_shards(model_path: str) -> list[str]:
+    """Sorted shard paths of a split-GGUF directory, or [] when not a split dir."""
+    if not (isinstance(model_path, str) and os.path.isdir(model_path)):
+        return []
+    names = sorted(f for f in os.listdir(model_path) if _SPLIT_GGUF.search(f))
+    if not names:
+        return []
+    return [os.path.join(model_path, n) for n in names]
+
+
 def is_gguf_path(model_path: str) -> bool:
-    """A single ``.gguf`` file (the only GGUF layout FreeToken loads directly)."""
-    return isinstance(model_path, str) and os.path.isfile(model_path) and model_path.endswith(
-        ".gguf"
-    )
+    """A single ``.gguf`` file or a split-GGUF directory (``-NNNNN-of-NNNNN.gguf``
+    shards) -- the two GGUF layouts FreeToken loads directly."""
+    if not isinstance(model_path, str):
+        return False
+    if model_path.endswith(".gguf") and os.path.isfile(model_path):
+        return True
+    return bool(_split_shards(model_path))
 
 
 # Canonical name of the metadata-only GGUF that ``convert_checkpoint`` drops into an FTW
@@ -67,11 +89,17 @@ def write_metadata_gguf(source_gguf: str, dest_path: str) -> None:
     """
     import gguf
 
-    reader = gguf.GGUFReader(source_gguf)
-    assert reader.tensors, f"{source_gguf}: no tensors to bound the KV section"
-    # The first tensor-info record starts exactly where the KV section ends (GGUF places no
-    # padding between KV and tensor infos; padding is only before the tensor *data*).
-    kv_end = int(reader.tensors[0].field.offset)
+    # In a split set every shard carries the same KV section and only its own tensor
+    # table, so the KV bound (first tensor-info offset) must be read from a shard that
+    # HAS tensors, while the KV bytes themselves come from the source shard verbatim.
+    readers = _readers(source_gguf) if os.path.isdir(source_gguf) else [gguf.GGUFReader(source_gguf)]
+    kv_end = None
+    for rd in readers:
+        if rd.tensors:
+            kv_end = int(rd.tensors[0].field.offset)
+            break
+    assert kv_end is not None, f"{source_gguf}: no shard carries a tensor table to bound the KV section"
+    reader = readers[0]
     buf = bytearray(reader.data[:kv_end].tobytes())  # header + all KV, verbatim
     buf[8:16] = b"\x00" * 8  # tensor_count is a u64 at byte 8; 0 is byte-order agnostic
     # The tensor table is dropped, but config derivation needs one fact from it (an
@@ -79,7 +107,7 @@ def write_metadata_gguf(source_gguf: str, dest_path: str) -> None:
     # extra KV and bump kv_count (u64 at byte 16). Little-endian only -- the re-parse
     # below fails loudly on a big-endian source.
     key = OUTPUT_WEIGHT_PRESENT_KV.encode()
-    present = any(t.name == "output.weight" for t in reader.tensors)
+    present = any(t.name == "output.weight" for r in readers for t in r.tensors)
     buf += struct.pack("<Q", len(key)) + key
     buf += struct.pack("<I", int(gguf.GGUFValueType.BOOL)) + bytes([1 if present else 0])
     struct.pack_into("<Q", buf, 16, struct.unpack_from("<Q", buf, 16)[0] + 1)
@@ -120,10 +148,24 @@ def _field_value(reader, name: str) -> Any:
 
 
 @functools.cache
-def _reader(model_path: str):
+def _readers(model_path: str):
+    """One gguf-py reader per shard: a single file gets one; a split-GGUF directory
+    gets one per ``-NNNNN-of-NNNNN.gguf`` shard (sorted)."""
     import gguf
 
-    return gguf.GGUFReader(model_path)
+    if os.path.isfile(model_path):
+        paths = [model_path]
+    else:
+        paths = _split_shards(model_path)
+        if not paths:
+            raise ValueError(f"{model_path}: no GGUF file or split shards found")
+    return tuple(gguf.GGUFReader(p) for p in paths)
+
+
+def _reader(model_path: str):
+    """The metadata shard: shard 1 of a split set carries the same full KV as every
+    other shard, so any reader answers metadata queries."""
+    return _readers(model_path)[0]
 
 
 @functools.cache
@@ -140,39 +182,45 @@ def gguf_architecture(model_path: str) -> str:
     return str(arch)
 
 
-def iter_gguf_tensors(model_path: str) -> Iterator[GgufTensor]:
-    """Yield every tensor with its torch shape, ggml type, and packed block bytes."""
+def _tensor_record(t):
+    """gguf-py tensor -> GgufTensor (torch shape, packed [rows, row_bytes] view)."""
     import gguf
 
-    reader = _reader(model_path)
-    for t in reader.tensors:
-        ne = [int(s) for s in t.shape]  # ggml order, fastest dim first
-        torch_shape = tuple(reversed(ne))
-        block, type_size = gguf.GGML_QUANT_SIZES[t.tensor_type]
-        n_fast = ne[0]
-        if n_fast % block != 0:
-            raise ValueError(
-                f"{t.name}: fastest dim {n_fast} not a multiple of block {block} "
-                f"for {t.tensor_type.name}"
-            )
-        row_bytes = n_fast // block * type_size
-        rows = int(np.prod(ne[1:])) if len(ne) > 1 else 1
-        # gguf-py returns quantized tensors as raw uint8 but F32/F16 as typed arrays;
-        # normalize everything to a flat byte view before shaping into [rows, row_bytes].
-        flat = np.ascontiguousarray(t.data).reshape(-1).view(np.uint8)
-        raw = flat.reshape(rows, row_bytes)
-        yield GgufTensor(
-            name=t.name,
-            shape=torch_shape,
-            ggml_type=int(t.tensor_type),
-            rows=rows,
-            row_bytes=row_bytes,
-            _raw=raw,
+    ne = [int(s) for s in t.shape]  # ggml order, fastest dim first
+    torch_shape = tuple(reversed(ne))
+    block, type_size = gguf.GGML_QUANT_SIZES[t.tensor_type]
+    n_fast = ne[0]
+    if n_fast % block != 0:
+        raise ValueError(
+            f"{t.name}: fastest dim {n_fast} not a multiple of block {block} "
+            f"for {t.tensor_type.name}"
         )
+    row_bytes = n_fast // block * type_size
+    rows = int(np.prod(ne[1:])) if len(ne) > 1 else 1
+    # gguf-py returns quantized tensors as raw uint8 but F32/F16 as typed arrays;
+    # normalize everything to a flat byte view before shaping into [rows, row_bytes].
+    flat = np.ascontiguousarray(t.data).reshape(-1).view(np.uint8)
+    raw = flat.reshape(rows, row_bytes)
+    return GgufTensor(
+        name=t.name,
+        shape=torch_shape,
+        ggml_type=int(t.tensor_type),
+        rows=rows,
+        row_bytes=row_bytes,
+        _raw=raw,
+    )
+
+
+def iter_gguf_tensors(model_path: str) -> Iterator[GgufTensor]:
+    """Yield every tensor (across all shards of a split set) with its torch shape,
+    ggml type, and packed block bytes."""
+    for reader in _readers(model_path):
+        for t in reader.tensors:
+            yield _tensor_record(t)
 
 
 def gguf_tensor_names(model_path: str) -> set[str]:
-    return {t.name for t in _reader(model_path).tensors}
+    return {t.name for r in _readers(model_path) for t in r.tensors}
 
 
 __all__ = [

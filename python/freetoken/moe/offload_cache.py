@@ -45,6 +45,10 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # native GGUF Q4_0 experts: packed block bytes per output row, dequantized inside
     # the borrowed ggml MoE kernels. gate_up [L*E, 2I, H//32*18], down [L*E, H, I//32*18].
     "q4_0": ("gate_up", "down"),
+    # native GGUF experts for GLM-5.3-Flash (unsloth UD-IQ4_XS tier): gate/up rows in
+    # IQ3_S blocks over H, down rows in IQ4_XS blocks over I. Same (gate_up, down)
+    # bank pair as q4_0; the per-format ggml types live in GGUF_EXPERT_QTYPES.
+    "gguf_glm5": ("gate_up", "down"),
     # native ModelOpt rows for the Triton inline-dequant kernels: packed e2m1 codes +
     # fp8-e4m3 per-16 block scales + per-output-row fp16 globals (w1/w3 carry distinct
     # globals, and folding them into the e4m3 block scales would underflow)
@@ -90,9 +94,25 @@ _BANK_BYTES_PER_EXPERT = {
         + (H // 128) * fp8_block_scale_pad(H // 128, I // 128)
     ) * 2,
     "q4_0": lambda H, I: 2 * I * (H // 32) * 18 + H * (I // 32) * 18,
+    # gguf_glm5: gate_up [2I, H//256*110] IQ3_S + down [H, I//256*136] IQ4_XS
+    "gguf_glm5": lambda H, I: 2 * I * (H // 256) * 110 + H * (I // 256) * 136,
     "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 2) + H * (I // 2 + I // 16 + 2),
     "mxfp4": lambda H, I: 2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2),
     "ds_fp4": lambda H, I: 2 * I * (H // 2 + H // 32) + H * (I // 2 + I // 32),
+}
+
+# gguf expert formats: (gate_up ggml type, down ggml type) per quant_format tag, read
+# by the MoE dispatch when calling into the ggml kernels. Formats whose banks all use
+# one type (q4_0) repeat it. Types come from models/gguf/dequant.py (torch-only module).
+from freetoken.models.gguf.dequant import (
+    GGML_IQ3_S,
+    GGML_IQ4_XS,
+    GGML_Q4_0,
+)
+
+GGUF_EXPERT_QTYPES: dict[str, tuple[int, int]] = {
+    "q4_0": (GGML_Q4_0, GGML_Q4_0),
+    "gguf_glm5": (GGML_IQ3_S, GGML_IQ4_XS),
 }
 
 # vLLM's marlin grouped-GEMM hands the full [cache_size] slot cache as its expert
